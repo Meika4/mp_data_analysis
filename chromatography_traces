@@ -1,0 +1,319 @@
+# =============================================================================
+# Chromatogram Plotter for MBiochem Part II Dissertation
+# Plots AC and SEC traces for mAbs, Fabs, and GPCs
+# Colours by competition group; GPC traces are black
+# =============================================================================
+
+library(ggplot2)
+library(tools)
+
+
+input_root  <- "C:/Users/shame/OneDrive/Documents/MBiochem/Part II/Project/AKTA/Chromatography CSVs to make into coded curves 4 diss"
+output_root <- "C:/Users/shame/OneDrive/Documents/MBiochem/Part II/Project/RStudio4Diss/RPlots"
+
+# -----------------------------------------------------------------------------
+#   COMPETITION GROUP COLOURS
+# -----------------------------------------------------------------------------
+competition_groups <- data.frame(
+  mAb   = c("mAb 10.4B", "mAb 12.1F", "mAb 19.7E",
+            "mAb 8.11G", "mAb 25.10C",
+            "mAb 37.2D", "mAb 37.2G", "mAb 18.5C", "mAb 9.8A",
+            "mAb 8.9F"),
+  group = c("GP1",   "GP1",   "GP1",
+            "GPC-A", "GPC-A",
+            "GPC-B", "GPC-B", "GPC-B", "GPC-B",
+            "GPC-C"),
+  stringsAsFactors = FALSE
+)
+
+group_colours <- c("GP1"     = "#0C447C",
+                   "GPC-A"   = "#E24B4A",
+                   "GPC-B"   = "#639922",
+                   "GPC-C"   = "#3B1F0C",
+                   "GPC"     = "#000000",
+                   "Unknown" = "#888888")
+
+# -----------------------------------------------------------------------------
+# SUBFOLDER MAP
+# -----------------------------------------------------------------------------
+folder_map <- list(
+  "mAbs AC"  = list(out = "mAbs AC traces",  type_long = "Affinity Chromatogram",       type_short = "AC"),
+  "mAbs SEC" = list(out = "mAbs SEC traces", type_long = "Size-Exclusion Chromatogram", type_short = "SEC"),
+  "Fabs AC"  = list(out = "Fabs AC traces",  type_long = "Affinity Chromatogram",       type_short = "AC"),
+  "Fabs SEC" = list(out = "Fabs SEC traces", type_long = "Size-Exclusion Chromatogram", type_short = "SEC"),
+  "GPC AC"   = list(out = "GPC AC traces",   type_long = "Affinity Chromatogram",       type_short = "AC"),
+  "GPC SEC"  = list(out = "GPC SEC traces",  type_long = "Size-Exclusion Chromatogram", type_short = "SEC")
+)
+
+# -----------------------------------------------------------------------------
+#   detect method from filename keywords
+# -----------------------------------------------------------------------------
+detect_method <- function(fname) {
+  fname_lower <- tolower(fname)
+  if (grepl("prism|mabselect|mab select", fname_lower))  return("mAbSelect PrismA")
+  if (grepl("streptrap|strep trap",        fname_lower))  return("StrepTrap")
+  if (grepl("histrap|his trap",            fname_lower))  return("HisTrap")
+  if (grepl("superose",                    fname_lower))  return("Superose")
+  if (grepl("superdex",                    fname_lower))  return("Superdex")
+  return("Unknown Method")
+}
+
+# -----------------------------------------------------------------------------
+#  short method tag for filename
+# -----------------------------------------------------------------------------
+method_tag <- function(method_str, type_short) {
+  tag <- gsub(" ", "", method_str)
+  paste0(type_short, "_", tag)
+}
+
+# -----------------------------------------------------------------------------
+# clean up a raw filename stem into a plot title
+# -----------------------------------------------------------------------------
+method_keywords <- paste0(
+  "(?i)\\b(",
+  paste(c("HiTrap", "HisTrap", "His Trap", "StrepTrap", "Strep Trap",
+          "mAbSelect", "mAb Select", "PrismA", "Prism A",
+          "Superose", "Superdex", "Superdex 200", "Superose 6",
+          "10300", "10/300", "GL", "5mL", "5 mL", "Excel",
+          "Increase", "Storage", "Sample", "Collect", "FT",
+          "1X", "Affinity", "SEC", "AC", "Run", "Inject",
+          "Column", "Elution", "Wash", "Buffer", "Load"),
+        collapse = "|"),
+  ")\\b"
+)
+
+extract_name <- function(fname_stem) {
+  s <- gsub("(?i)pbl056", "MDS7", fname_stem, perl = TRUE)
+  
+  if (grepl("(?i)MDS7", s, perl = TRUE)) {
+    m <- regmatches(s, regexpr("(?i)MDS7\\s*\\d+", s, perl = TRUE))
+    if (length(m) == 1 && nchar(m) > 0) {
+      clean <- gsub("(?i)MDS7\\s*", "MDS7 ", m, perl = TRUE)
+      return(trimws(clean))
+    }
+    return("MDS7")
+  }
+  
+  s <- gsub("\\d{4}-\\d{2}-\\d{2}", "", s)
+  s <- gsub("\\[.*?\\]|\\(.*?\\)", "", s)
+  s <- gsub(method_keywords, "", s, perl = TRUE)
+  
+  tokens <- regmatches(s,
+                       gregexpr("(?i)(mAb|Fab)\\s+[A-Za-z0-9\\.]+", s, perl = TRUE))[[1]]
+  if (length(tokens) > 0) {
+    tokens <- gsub("(?i)^mab", "mAb", tokens, perl = TRUE)
+    tokens <- gsub("(?i)^fab", "Fab", tokens, perl = TRUE)
+    return(trimws(paste(unique(tokens), collapse = " + ")))
+  }
+  
+  s <- gsub("[_,+\\-]+", " ", s)
+  s <- gsub("\\s{2,}", " ", s)
+  s <- trimws(s)
+  
+  if (nchar(trimws(s)) == 0) {
+    s <- trimws(gsub("\\d{4}-\\d{2}-\\d{2}|\\[.*?\\]|\\(.*?\\)", "", fname_stem))
+  }
+  return(trimws(s))
+}
+
+# -----------------------------------------------------------------------------
+# look up competition group colour 
+# -----------------------------------------------------------------------------
+get_colour <- function(protein_name, folder_name) {
+  if (grepl("^GPC", folder_name, ignore.case = TRUE)) return(group_colours["GPC"])
+  
+  idx <- which(sapply(competition_groups$mAb, function(x)
+    grepl(x, protein_name, fixed = TRUE) |
+      grepl(protein_name, x, fixed = TRUE)))
+  
+  if (length(idx) > 0) {
+    grp <- competition_groups$group[idx[1]]
+    return(group_colours[grp])
+  }
+  
+  clone <- sub("(?i)Fab\\s+", "", protein_name)
+  idx2  <- which(sapply(competition_groups$mAb, function(x) grepl(clone, x, fixed = TRUE)))
+  if (length(idx2) > 0) {
+    grp <- competition_groups$group[idx2[1]]
+    return(group_colours[grp])
+  }
+  
+  return(group_colours["Unknown"])
+}
+
+# -----------------------------------------------------------------------------
+#  read ÄKTA CSV 
+# -----------------------------------------------------------------------------
+read_akta_csv <- function(filepath) {
+  raw      <- readLines(filepath, warn = FALSE, encoding = "latin1")
+  sep_char <- if (any(grepl("\t", raw[1:min(20, length(raw))]))) "\t" else ","
+  
+  data_start <- NA
+  for (i in seq_along(raw)) {
+    fields <- strsplit(raw[i], sep_char)[[1]]
+    if (length(fields) >= 2) {
+      v1 <- suppressWarnings(as.numeric(gsub(",", ".", trimws(fields[1]))))
+      v2 <- suppressWarnings(as.numeric(gsub(",", ".", trimws(fields[2]))))
+      if (!is.na(v1) && !is.na(v2)) { data_start <- i; break }
+    }
+  }
+  
+  if (is.na(data_start)) {
+    warning("Could not find numeric data in: ", filepath)
+    return(NULL)
+  }
+  
+  header_names <- c("ml", "mau")
+  if (data_start > 1) {
+    prev <- strsplit(raw[data_start - 1], sep_char)[[1]]
+    if (any(tolower(trimws(prev)) %in% header_names) |
+        !suppressWarnings(all(!is.na(as.numeric(trimws(prev)))))) {
+      skip_n <- data_start - 1
+    } else {
+      skip_n <- data_start - 1
+    }
+  } else {
+    skip_n <- 0
+  }
+  
+  df <- tryCatch(
+    read.table(filepath, header = (data_start > 1 && !is.na(data_start) && data_start > 1),
+               sep = sep_char, skip = max(0, data_start - 2),
+               fill = TRUE, comment.char = "",
+               stringsAsFactors = FALSE, encoding = "latin1"),
+    error = function(e) NULL
+  )
+  
+  if (is.null(df) || ncol(df) < 2) return(NULL)
+  
+  df[[1]] <- suppressWarnings(as.numeric(gsub(",", ".", as.character(df[[1]]))))
+  df[[2]] <- suppressWarnings(as.numeric(gsub(",", ".", as.character(df[[2]]))))
+  df      <- df[!is.na(df[[1]]) & !is.na(df[[2]]), ]
+  
+  colnames(df)[1:2] <- c("ml", "mAU")
+  return(df[, c("ml", "mAU")])
+}
+
+# -----------------------------------------------------------------------------
+# build output filename
+# -----------------------------------------------------------------------------
+build_output_name <- function(protein_name, type_short, method_str) {
+  tag       <- method_tag(method_str, type_short)
+  safe_name <- gsub("(?i)pbl056", "MDS7", protein_name, perl = TRUE)
+  safe_name <- gsub(" \\+ ", " & ", safe_name)
+  fname     <- paste0(safe_name, " ", tag, ".png")
+  fname     <- gsub('[<>:"/\\\\|?*]', "_", fname)
+  return(fname)
+}
+
+# -----------------------------------------------------------------------------
+# SCALE plots
+# -----------------------------------------------------------------------------
+group_axis <- list(
+  SEC_GPC   = list(x_limit=20,  x_step=1,  x_minor=0.5, y_step=NULL, y_minor=NULL),
+  SEC_mAb   = list(x_limit=20,  x_step=1,  x_minor=0.5, y_step=NULL, y_minor=NULL),
+  SEC_Fab   = list(x_limit=20,  x_step=1,  x_minor=0.5, y_step=NULL, y_minor=NULL),
+  mAbSelect = list(x_limit=150, x_step=10, x_minor=5,   y_step=100,  y_minor=50),
+  StrepTrap = list(x_limit=120, x_step=10, x_minor=5,   y_step=200,  y_minor=100),
+  HisTrap   = list(x_limit=600, x_step=50, x_minor=25,  y_step=NULL, y_minor=NULL)
+)
+
+get_axis_params <- function(subfolder, method_str) {
+  if (grepl("SEC", subfolder, ignore.case = TRUE)) {
+    if (grepl("GPC", subfolder, ignore.case = TRUE)) return(group_axis$SEC_GPC)
+    if (grepl("mAb", subfolder, ignore.case = TRUE)) return(group_axis$SEC_mAb)
+    if (grepl("Fab", subfolder, ignore.case = TRUE)) return(group_axis$SEC_Fab)
+  }
+  if (grepl("mAbSelect|PrismA", method_str, ignore.case = TRUE)) return(group_axis$mAbSelect)
+  if (grepl("StrepTrap",        method_str, ignore.case = TRUE)) return(group_axis$StrepTrap)
+  if (grepl("HisTrap",          method_str, ignore.case = TRUE)) return(group_axis$HisTrap)
+  return(NULL)
+}
+
+# -----------------------------------------------------------------------------
+# MAIN LOOP
+# -----------------------------------------------------------------------------
+message("\nGenerating plots...")
+
+for (subfolder in names(folder_map)) {
+  
+  in_dir     <- file.path(input_root,  subfolder)
+  out_dir    <- file.path(output_root, folder_map[[subfolder]]$out)
+  type_long  <- folder_map[[subfolder]]$type_long
+  type_short <- folder_map[[subfolder]]$type_short
+  
+  if (!dir.exists(in_dir)) { message("Skipping (folder not found): ", in_dir); next }
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  csv_files <- list.files(in_dir, pattern = "\\.csv$", ignore.case = TRUE, full.names = TRUE)
+  if (length(csv_files) == 0) { message("No CSV files found in: ", in_dir); next }
+  
+  for (csv_path in csv_files) {
+    
+    fname_stem   <- file_path_sans_ext(basename(csv_path))
+    protein_name <- extract_name(fname_stem)
+    method_str   <- detect_method(fname_stem)
+    trace_colour <- get_colour(protein_name, subfolder)
+    plot_title   <- protein_name
+    out_fname    <- build_output_name(protein_name, type_short, method_str)
+    out_path     <- file.path(out_dir, out_fname)
+    
+    dat <- read_akta_csv(csv_path)
+    if (is.null(dat) || nrow(dat) < 2) { message("Could not read data from: ", csv_path); next }
+    
+    ax <- get_axis_params(subfolder, method_str)
+    if (is.null(ax)) {
+      xmax   <- max(dat$ml, na.rm = TRUE)
+      x_step <- 5
+      ax     <- list(x_limit = ceiling(xmax/x_step)*x_step, x_step = x_step,
+                     x_minor = x_step/2, y_step = NULL, y_minor = NULL)
+    }
+    
+    y_max   <- max(dat$mAU, na.rm = TRUE)
+    y_scale <- if (!is.null(ax$y_step)) {
+      base       <- ax$y_step
+      candidates <- base * c(1, 2, 5, 10, 20, 50)
+      y_step     <- candidates[which.min(abs(y_max / candidates - 8))]
+      y_minor    <- y_step / 2
+      y_lim      <- ceiling(y_max / y_step) * y_step
+      scale_y_continuous(
+        limits       = c(min(0, floor(min(dat$mAU, na.rm=TRUE))), y_lim),
+        breaks       = seq(0, y_lim, by = y_step),
+        minor_breaks = seq(0, y_lim, by = y_minor)
+      )
+    } else {
+      scale_y_continuous(limits = c(NA, NA), expand = expansion(mult = c(0.02, 0.05)))
+    }
+    
+    p <- ggplot(dat, aes(x = ml, y = mAU)) +
+      geom_line(colour = trace_colour, linewidth = 0.7) +
+      scale_x_continuous(
+        limits       = c(0, ax$x_limit),
+        breaks       = seq(0, ax$x_limit, by = ax$x_step),
+        minor_breaks = seq(0, ax$x_limit, by = ax$x_minor)
+      ) +
+      y_scale +
+      labs(
+        title    = plot_title,
+        subtitle = type_long,
+        x        = "Volume (ml)",
+        y        = "Absorbance (mAU)"
+      ) +
+      theme_classic(base_size = 28) +
+      theme(
+        plot.title       = element_text(face = "bold", size = 34),
+        plot.subtitle    = element_text(size = 28, colour = "grey40"),
+        axis.text        = element_text(size = 28),
+        axis.title       = element_text(size = 28),
+        axis.line        = element_line(colour = "black"),
+        axis.ticks       = element_line(colour = "black"),
+        panel.grid.major = element_line(colour = "grey88", linewidth = 0.4),
+        panel.grid.minor = element_line(colour = "grey93", linewidth = 0.25)
+      )
+    
+    ggsave(out_path, plot = p, width = 14, height = 9, units = "in", device = "png", dpi = 600)
+    message("Saved: ", out_path)
+  }
+}
+
+message("\nAll done! Check your output folders in:\n", output_root)
