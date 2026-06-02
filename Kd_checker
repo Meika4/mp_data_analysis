@@ -1,0 +1,563 @@
+## ============================================================
+##  MP Single-Shot Kd Diagnostic V2.5
+## ============================================================
+
+library(tidyverse)
+library(stringr)
+library(ggplot2)
+library(ggtext)
+
+## ---- 1. Parameters -----------------------------------------
+MDS7_total_nM   <- 20
+no_binding_mabs <- c("mAb 8.9F")
+all_concs       <- c(4, 5, 10, 20, 40)
+
+input_file <- "C:\\Users\\shame\\OneDrive\\Documents\\MBiochem\\Part II\\Project\\MP Data\\All mAb MDS7 data\\mAbs_MDS7_Monomer_All_Concentrations.csv"
+out_dir    <- "C:\\Users\\shame\\OneDrive\\Documents\\MBiochem\\Part II\\Project\\RStudio4Diss\\RPlots\\KdCheckerV2.5 3x3"
+
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+## ---- 2. Epitope groups and colours -------------------------
+competition_groups <- tribble(
+  ~clone,    ~group,
+  "12.1F",   "GP1",
+  "19.7E",   "GP1",
+  "10.4B",   "GP1",
+  "25.10C",  "GPC-A",
+  "36.1F",   "GPC-A",
+  "8.11G",   "GPC-A",
+  "37.2D",   "GPC-B",
+  "37.7H",   "GPC-B",
+  "37.2G",   "GPC-B",
+  "36.9F",   "GPC-B",
+  "25.6A",   "GPC-B",
+  "2.9D",    "GPC-B",
+  "18.5C",   "GPC-B",
+  "NE13",    "GPC-B",
+  "9.8A",    "GPC-B",
+  "8.9F",    "GPC-C"
+)
+
+group_colours <- c(
+  "GP1"   = "#0C447C",
+  "GPC-A" = "#E24B4A",
+  "GPC-B" = "#639922",
+  "GPC-C" = "#3B1F0C"
+)
+
+cg_join <- competition_groups %>%
+  mutate(mAb = paste0("mAb ", clone)) %>%
+  select(mAb, group, clone)
+
+## ---- 3. Load and parse data --------------------------------
+raw <- read.csv(input_file,
+                header           = TRUE,
+                check.names      = FALSE,
+                stringsAsFactors = FALSE,
+                na.strings       = "NA")
+
+colnames(raw)[1:2] <- c("row_idx", "Measurement_Name")
+
+dat <- raw %>%
+  filter(grepl("mAb.*[Mm][Dd][Ss]7 Monomer", Measurement_Name, ignore.case = TRUE)) %>%
+  mutate(Measurement_Name = sub("^[0-9]+_", "", Measurement_Name))
+
+parse_name <- function(name) {
+  name_clean <- str_squish(name)
+  mab  <- str_extract(name_clean, "mAb [0-9]+\\.[0-9]+[A-Z]")
+  conc <- as.numeric(
+    str_match(name_clean,
+              "mAb [0-9]+\\.[0-9]+[A-Z]\\s+([0-9]+)\\s*nM")[, 2])
+  rep  <- str_extract(name_clean, "[IVX]+$")
+  data.frame(mAb = mab, mAb_nM = conc, replicate = rep,
+             stringsAsFactors = FALSE)
+}
+
+meta <- do.call(rbind, lapply(dat$Measurement_Name, parse_name))
+dat  <- cbind(meta, dat)
+dat  <- dat %>% filter(mAb_nM %in% all_concs)
+
+## ---- 4. Extract Gaussian peak counts -----------------------
+extract_peaks <- function(row) {
+  peaks <- list()
+  for (i in 1:8) {
+    pos_col <- paste0(i, ": Mass position (kDa) - Gaussian Overlay")
+    abs_col <- paste0(i, ": Mass absolute count - Gaussian Overlay")
+    if (!pos_col %in% names(row)) next
+    pos     <- suppressWarnings(as.numeric(trimws(as.character(row[[pos_col]]))))
+    abs_val <- suppressWarnings(as.numeric(trimws(as.character(row[[abs_col]]))))
+    if (length(pos) == 1 && length(abs_val) == 1 &&
+        !is.na(pos) && !is.na(abs_val) && pos > 0)
+      peaks[[length(peaks) + 1]] <- data.frame(
+        peak = i, mass_kDa = pos, abs_count = abs_val)
+  }
+  if (length(peaks) == 0) return(NULL)
+  do.call(rbind, peaks)
+}
+
+all_peaks <- lapply(seq_len(nrow(dat)), function(i) {
+  pk <- extract_peaks(dat[i, ])
+  if (is.null(pk)) return(NULL)
+  cbind(dat[i, c("mAb", "mAb_nM", "replicate", "Measurement_Name")], pk)
+})
+peaks_df <- do.call(rbind, all_peaks)
+
+## ---- 5. Assign species by kDa window -----------------------
+assign_species <- function(mass) {
+  case_when(
+    mass >= 60  & mass <= 100 ~ "free_MDS7",
+    mass >= 130 & mass <= 180 ~ "free_mAb",
+    mass >= 185 & mass <= 235 ~ "complex_1_1",
+    mass >= 240 & mass <= 330 ~ "complex_1_2",
+    TRUE                      ~ "other"
+  )
+}
+peaks_df <- peaks_df %>% mutate(species = assign_species(mass_kDa))
+
+## ---- 6. Pivot: one row per measurement ---------------------
+species_counts <- peaks_df %>%
+  filter(species != "other") %>%
+  group_by(mAb, mAb_nM, replicate, Measurement_Name, species) %>%
+  slice_max(abs_count, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(mAb, mAb_nM, replicate, Measurement_Name, species, abs_count) %>%
+  pivot_wider(names_from = species, values_from = abs_count, values_fill = 0)
+
+for (col in c("free_MDS7", "free_mAb", "complex_1_1", "complex_1_2")) {
+  if (!col %in% names(species_counts)) species_counts[[col]] <- 0
+}
+
+## ---- 7. Calculate single-shot Kd1 and Kd2 -----------------
+kd_data <- species_counts %>%
+  filter(!mAb %in% no_binding_mabs) %>%
+  mutate(
+    total_mAb_counts = free_mAb + complex_1_1 + complex_1_2,
+    f_conv        = ifelse(total_mAb_counts > 0, mAb_nM / total_mAb_counts, NA_real_),
+    conc_mAb_free = free_mAb    * f_conv,
+    conc_1_1      = complex_1_1 * f_conv,
+    conc_1_2      = complex_1_2 * f_conv,
+    conc_M_free   = MDS7_total_nM - conc_1_1 - 2 * conc_1_2,
+    Kd1 = ifelse(conc_1_1 > 0 & conc_M_free > 0 & !is.na(f_conv),
+                 conc_mAb_free * conc_M_free / conc_1_1, NA_real_),
+    Kd2 = ifelse(conc_1_2 > 0 & conc_M_free > 0 & !is.na(f_conv),
+                 conc_1_1 * conc_M_free / conc_1_2, NA_real_),
+    frac_bound  = (conc_1_1 + conc_1_2) / mAb_nM,
+    coop_ratio  = Kd2 / Kd1
+  ) %>%
+  filter(!is.na(Kd1), conc_M_free > 0, total_mAb_counts > 0) %>%
+  left_join(cg_join, by = "mAb")
+
+## ---- 8. Linear regression per mAb --------------------------
+calc_lm <- function(x, y) {
+  df <- data.frame(x = x, y = y) %>% filter(!is.na(y))
+  if (nrow(df) < 3) return(list(slope     = NA_real_,
+                                intercept = NA_real_,
+                                r2        = NA_real_,
+                                p         = NA_real_,
+                                n         = nrow(df)))
+  fit <- lm(y ~ x, data = df)
+  s   <- summary(fit)
+  list(slope     = coef(fit)[2],
+       intercept = coef(fit)[1],
+       r2        = s$r.squared,
+       p         = coef(s)[2, 4],
+       n         = nrow(df))
+}
+
+lm_results <- kd_data %>%
+  group_by(mAb, group, clone) %>%
+  summarise(
+    kd1_lm    = list(calc_lm(mAb_nM, Kd1)),
+    Kd1_mean  = mean(Kd1, na.rm = TRUE),
+    Kd1_sd    = sd(Kd1,   na.rm = TRUE),
+    kd2_lm    = list(calc_lm(mAb_nM, Kd2)),
+    Kd2_mean  = mean(Kd2, na.rm = TRUE),
+    Kd2_sd    = sd(Kd2,   na.rm = TRUE),
+    coop_mean = mean(coop_ratio, na.rm = TRUE),
+    .groups   = "drop"
+  ) %>%
+  mutate(
+    kd1_slope = map_dbl(kd1_lm, ~.x$slope),
+    kd1_r2    = map_dbl(kd1_lm, ~.x$r2),
+    kd1_p     = map_dbl(kd1_lm, ~.x$p),
+    kd2_slope = map_dbl(kd2_lm, ~.x$slope),
+    kd2_r2    = map_dbl(kd2_lm, ~.x$r2),
+    kd2_p     = map_dbl(kd2_lm, ~.x$p),
+    verdict = case_when(
+      is.na(kd1_r2)                          ~ "Insufficient data",
+      kd1_r2 >= 0.50 | kd1_p <= 0.05        ~ "TRENDING",
+      kd1_r2 >= 0.20 & kd1_p  > 0.05        ~ "CAUTION",
+      TRUE                                   ~ "VALID"
+    )
+  )
+
+## ---- 9. Print summary table --------------------------------
+cat("\n=== SINGLE-SHOT Kd DIAGNOSTIC SUMMARY (V2.5) ===\n\n")
+lm_results %>%
+  transmute(
+    Clone     = clone,
+    Group     = group,
+    Kd1_slope = sprintf("%.2f",  kd1_slope),
+    Kd1_R2    = sprintf("%.3f",  kd1_r2),
+    Kd1_p     = sprintf("%.3f",  kd1_p),
+    Kd2_slope = sprintf("%.2f",  kd2_slope),
+    Kd2_R2    = sprintf("%.3f",  kd2_r2),
+    Kd2_p     = sprintf("%.3f",  kd2_p),
+    Verdict   = verdict
+  ) %>%
+  print(n = 20, width = 200)
+
+## ---- 10. Individual diagnostic plots -----------------------
+plot_kd_combined <- function(mab_name, kd_df, lm_df, out_dir) {
+  
+  this_kd <- kd_df %>% filter(mAb == mab_name)
+  this_lm <- lm_df %>% filter(mAb == mab_name)
+  if (nrow(this_kd) == 0) return(invisible(NULL))
+  
+  grp   <- this_lm$group[1]
+  clone <- this_lm$clone[1]
+  col   <- unname(group_colours[grp])
+  
+  kd1_slope <- this_lm$kd1_slope
+  kd1_r2    <- this_lm$kd1_r2
+  kd1_p     <- this_lm$kd1_p
+  kd2_slope <- this_lm$kd2_slope
+  kd2_r2    <- this_lm$kd2_r2
+  kd2_p     <- this_lm$kd2_p
+  
+  fmt_p <- function(pv) {
+    if (is.na(pv)) return("NA")
+    if (pv < 0.001) return("<0.001")
+    sprintf("%.3f", pv)
+  }
+  
+  ann1 <- sprintf(
+    "K<sub>d1</sub>:  slope = %.2f  |  R\u00b2 = %.3f  |  p = %s",
+    ifelse(is.na(kd1_slope), 0, kd1_slope),
+    ifelse(is.na(kd1_r2),    0, kd1_r2),
+    fmt_p(kd1_p))
+  
+  ann2 <- if (!is.na(kd2_r2)) {
+    sprintf(
+      "K<sub>d2</sub>:  slope = %.2f  |  R\u00b2 = %.3f  |  p = %s",
+      ifelse(is.na(kd2_slope), 0, kd2_slope),
+      ifelse(is.na(kd2_r2),    0, kd2_r2),
+      fmt_p(kd2_p))
+  } else "K<sub>d2</sub>:  insufficient data"
+  
+  means_kd1 <- this_kd %>% filter(!is.na(Kd1)) %>%
+    group_by(mAb_nM) %>%
+    summarise(m = mean(Kd1), s = replace_na(sd(Kd1), 0), .groups = "drop")
+  means_kd2 <- this_kd %>% filter(!is.na(Kd2)) %>%
+    group_by(mAb_nM) %>%
+    summarise(m = mean(Kd2), s = replace_na(sd(Kd2), 0), .groups = "drop")
+  
+  p <- ggplot() +
+    geom_point(data = this_kd %>% filter(!is.na(Kd1)),
+               aes(x = mAb_nM, y = Kd1),
+               shape = 16, size = 2.5, colour = col, alpha = 0.45) +
+    geom_point(data = means_kd1, aes(x = mAb_nM, y = m),
+               shape = 16, size = 4, colour = col) +
+    geom_errorbar(data = means_kd1,
+                  aes(x = mAb_nM, ymin = m - s, ymax = m + s),
+                  colour = col, width = 0.8) +
+    geom_smooth(data = this_kd %>% filter(!is.na(Kd1)),
+                aes(x = mAb_nM, y = Kd1),
+                method = "lm", formula = y ~ x, se = FALSE,
+                colour = col, linewidth = 0.9, linetype = "solid") +
+    geom_point(data = this_kd %>% filter(!is.na(Kd2)),
+               aes(x = mAb_nM, y = Kd2),
+               shape = 22, size = 2.5, colour = col, fill = "white",
+               stroke = 0.8, alpha = 0.45) +
+    { if (nrow(means_kd2) > 0) list(
+      geom_point(data = means_kd2, aes(x = mAb_nM, y = m),
+                 shape = 22, size = 4, colour = col,
+                 fill = "white", stroke = 1.2),
+      geom_errorbar(data = means_kd2,
+                    aes(x = mAb_nM, ymin = m - s, ymax = m + s),
+                    colour = col, width = 0.8, linetype = "dashed")
+    )} +
+    { if (sum(!is.na(this_kd$Kd2)) >= 3)
+      geom_smooth(data = this_kd %>% filter(!is.na(Kd2)),
+                  aes(x = mAb_nM, y = Kd2),
+                  method = "lm", formula = y ~ x, se = FALSE,
+                  colour = col, linewidth = 0.9, linetype = "dashed") } +
+    coord_cartesian(clip = "off") +
+    annotate("segment", x = 28, xend = 33, y = 168, yend = 168,
+             colour = col, linewidth = 0.9, linetype = "solid") +
+    annotate("point",   x = 30.5, y = 168,
+             shape = 16, size = 3, colour = col) +
+    annotate("text",    x = 34, y = 168,
+             label = expression(K[d1]), hjust = 0, size = 18, colour = "black") +
+    annotate("segment", x = 28, xend = 33, y = 158, yend = 158,
+             colour = col, linewidth = 0.9, linetype = "dashed") +
+    annotate("point",   x = 30.5, y = 158,
+             shape = 22, size = 3,
+             colour = col, fill = "white", stroke = 1) +
+    annotate("text",    x = 34, y = 158,
+             label = expression(K[d2]), hjust = 0, size = 18, colour = "black") +
+    scale_x_continuous(name = "[mAb] (nM)", breaks = all_concs,
+                       limits = c(0, 45)) +
+    scale_y_continuous(name = expression(italic(K)[d*",app"] ~ "(nM)"),
+                       limits = c(0, 150), breaks = seq(0, 150, 25)) +
+    labs(title    = paste0("mAb ", clone),
+         subtitle = paste0(ann1, "<br>", ann2)) +
+    theme_classic(base_size = 48) +
+    theme(
+      plot.title    = element_text(face = "bold", size = 48, colour = "black"),
+      plot.subtitle = ggtext::element_markdown(size = 36, colour = "black",
+                                               lineheight = 1.2),
+      axis.title    = element_text(size = 48, colour = "black"),
+      axis.text     = element_text(size = 38, colour = "black"),
+      panel.grid.major = element_line(colour = "grey92", linewidth = 0.3),
+      plot.margin   = margin(40, 15, 10, 10)
+    )
+  
+  fname <- file.path(out_dir, paste0("Kd_diagnostic_", clone, ".png"))
+  ggsave(fname, p, width = 14, height = 9, dpi = 600, bg = "white")
+  cat("  Saved:", fname, "\n")
+  return(invisible(p))
+}
+
+## ---- 11. Run individual plots ------------------------------
+cat("\n=== Generating individual diagnostic plots ===\n\n")
+for (m in unique(kd_data$mAb)) {
+  plot_kd_combined(m, kd_data, lm_results, out_dir)
+}
+
+## ---- 12. Save CSVs -----------------------------------------
+summary_out <- lm_results %>%
+  transmute(
+    Clone          = clone,
+    Group          = group,
+    Kd1_mean_nM    = round(Kd1_mean,  1),
+    Kd1_sd_nM      = round(Kd1_sd,    1),
+    Kd1_CV_pct     = round(Kd1_sd / Kd1_mean * 100, 0),
+    Kd1_slope      = round(kd1_slope, 3),
+    Kd1_R2         = round(kd1_r2,    3),
+    Kd1_p          = round(kd1_p,     3),
+    Kd2_mean_nM    = round(Kd2_mean,  1),
+    Kd2_sd_nM      = round(Kd2_sd,    1),
+    Kd2_slope      = round(kd2_slope, 3),
+    Kd2_R2         = round(kd2_r2,    3),
+    Kd2_p          = round(kd2_p,     3),
+    Kd2_Kd1_ratio  = round(coop_mean, 1),
+    Verdict        = verdict
+  )
+write.csv(summary_out,
+          file.path(out_dir, "Kd_diagnostic_summary.csv"),
+          row.names = FALSE)
+
+raw_out <- kd_data %>%
+  select(mAb, clone, group, mAb_nM, replicate,
+         conc_mAb_free, conc_1_1, conc_1_2, conc_M_free,
+         Kd1, Kd2, frac_bound, coop_ratio) %>%
+  mutate(across(where(is.numeric), ~round(.x, 3)))
+write.csv(raw_out,
+          file.path(out_dir, "Kd_raw_per_replicate.csv"),
+          row.names = FALSE)
+
+cat("\nCSVs saved to:", out_dir, "\n")
+
+## ----  Flextable helpers ---------------------------------
+library(flextable)
+library(officer)
+
+fmt_p_cell <- function(pv) {
+  if (is.na(pv))    return("\u2014")
+  if (pv < 0.001)   return("<0.001")
+  sprintf("%.3f", pv)
+}
+
+make_diagnostic_flextable <- function(lm_res, filepath_png, filepath_csv) {
+  
+  tbl <- lm_res %>%
+    transmute(
+      mAb       = clone,        
+      Group     = group,
+      Kd1_slope = round(kd1_slope, 2),
+      Kd1_R2    = round(kd1_r2,    3),
+      Kd2_slope = round(kd2_slope, 2),
+      Kd2_R2    = round(kd2_r2,    3),
+      Verdict   = verdict
+    ) %>%
+    arrange(Group, mAb)
+  
+  write.csv(tbl, filepath_csv, row.names = FALSE)
+  
+  tbl_disp <- tbl %>%
+    select(-Verdict) %>%
+    mutate(
+      Kd1_slope = ifelse(is.na(Kd1_slope), "\u2014", sprintf("%.2f", Kd1_slope)),
+      Kd1_R2    = ifelse(is.na(Kd1_R2),    "\u2014", sprintf("%.3f", Kd1_R2)),
+      Kd2_slope = ifelse(is.na(Kd2_slope), "\u2014", sprintf("%.2f", Kd2_slope)),
+      Kd2_R2    = ifelse(is.na(Kd2_R2),    "\u2014", sprintf("%.3f", Kd2_R2))
+    )
+  
+  row_colours <- tbl_disp$Group
+  nr <- nrow(tbl_disp)
+  
+  ft <- flextable(tbl_disp) %>%
+    compose(part = "header", j = "Kd1_slope",
+            value = as_paragraph("K", as_sub("d1"), " slope")) %>%
+    compose(part = "header", j = "Kd1_R2",
+            value = as_paragraph("K", as_sub("d1"), " R\u00b2")) %>%
+    compose(part = "header", j = "Kd2_slope",
+            value = as_paragraph("K", as_sub("d2"), " slope")) %>%
+    compose(part = "header", j = "Kd2_R2",
+            value = as_paragraph("K", as_sub("d2"), " R\u00b2")) %>%
+    border_remove() %>%
+    border_outer(part = "all",  border = fp_border(color = "black", width = 1.5)) %>%
+    hline(part = "header", i = 1,
+          border = fp_border(color = "black", width = 1.5)) %>%
+    hline(part = "body", i = seq_len(nr - 1),
+          border = fp_border(color = "black", width = 0.5)) %>%
+    vline(part = "all", border = fp_border(color = "black", width = 0.5)) %>%
+    vline_right(part = "all",
+                border = fp_border(color = "black", width = 1.5)) %>%
+    align(part = "header", align = "center") %>%
+    align(part = "body",   align = "center") %>%
+    align(part = "body", j = "mAb", align = "left") %>%   # ← changed from "Clone"
+    font(part = "all", fontname = "Arial") %>%
+    fontsize(part = "header", size = 11) %>%
+    fontsize(part = "body",   size = 10) %>%
+    bold(part = "header") %>%
+    color(i = which(row_colours == "GP1"),
+          color = group_colours[["GP1"]],   part = "body") %>%
+    color(i = which(row_colours == "GPC-A"),
+          color = group_colours[["GPC-A"]], part = "body") %>%
+    color(i = which(row_colours == "GPC-B"),
+          color = group_colours[["GPC-B"]], part = "body") %>%
+    color(i = which(row_colours == "GPC-C"),
+          color = group_colours[["GPC-C"]], part = "body") %>%
+    width(j = "mAb",      width = 0.8)  %>%   # ← changed from "Clone"
+    width(j = "Group",     width = 0.7)  %>%
+    width(j = "Kd1_slope", width = 0.85) %>%
+    width(j = "Kd1_R2",    width = 0.75) %>%
+    width(j = "Kd2_slope", width = 0.85) %>%
+    width(j = "Kd2_R2",    width = 0.75) %>%
+    height_all(height = 0.28) %>%
+    hrule(rule = "exact") %>%
+    padding(padding.top = 4, padding.bottom = 4,
+            padding.left = 6, padding.right = 6, part = "all")
+  
+  save_as_image(ft, path = filepath_png, res = 300)
+  message("Diagnostic flextable saved: ", filepath_png)
+  invisible(ft)
+}
+
+make_diagnostic_flextable(
+  lm_res       = lm_results,
+  filepath_png = file.path(out_dir, "Kd_diagnostic_summary_table.png"),
+  filepath_csv = file.path(out_dir, "Kd_diagnostic_summary_table.csv")
+)
+
+make_pvalue_flextable <- function(lm_res, filepath_png, filepath_csv) {
+  
+  tbl <- lm_res %>%
+    transmute(
+      mAb       = clone,        # ← changed from Clone = clone
+      Group     = group,
+      Kd1_slope = kd1_slope,
+      Kd1_R2    = kd1_r2,
+      Kd1_p     = kd1_p,
+      Kd2_slope = kd2_slope,
+      Kd2_R2    = kd2_r2,
+      Kd2_p     = kd2_p,
+      Verdict   = verdict
+    ) %>%
+    arrange(Group, mAb)
+  
+  write.csv(tbl, filepath_csv, row.names = FALSE)
+  
+  tbl_disp <- tbl %>%
+    mutate(
+      Kd1_slope = ifelse(is.na(Kd1_slope), "\u2014", sprintf("%.2f", Kd1_slope)),
+      Kd1_R2    = ifelse(is.na(Kd1_R2),    "\u2014", sprintf("%.3f", Kd1_R2)),
+      Kd1_p     = sapply(Kd1_p, fmt_p_cell),
+      Kd2_slope = ifelse(is.na(Kd2_slope), "\u2014", sprintf("%.2f", Kd2_slope)),
+      Kd2_R2    = ifelse(is.na(Kd2_R2),    "\u2014", sprintf("%.3f", Kd2_R2)),
+      Kd2_p     = sapply(Kd2_p, fmt_p_cell)
+    )
+  
+  row_colours  <- tbl_disp$Group
+  nr           <- nrow(tbl_disp)
+  kd1_sig_rows <- which(tbl$Kd1_p <= 0.05 & !is.na(tbl$Kd1_p))
+  kd2_sig_rows <- which(tbl$Kd2_p <= 0.05 & !is.na(tbl$Kd2_p))
+  
+  ft <- flextable(tbl_disp) %>%
+    compose(part = "header", j = "Kd1_slope",
+            value = as_paragraph("K", as_sub("d1"), " slope")) %>%
+    compose(part = "header", j = "Kd1_R2",
+            value = as_paragraph("K", as_sub("d1"), " R\u00b2")) %>%
+    compose(part = "header", j = "Kd1_p",
+            value = as_paragraph("K", as_sub("d1"), " p")) %>%
+    compose(part = "header", j = "Kd2_slope",
+            value = as_paragraph("K", as_sub("d2"), " slope")) %>%
+    compose(part = "header", j = "Kd2_R2",
+            value = as_paragraph("K", as_sub("d2"), " R\u00b2")) %>%
+    compose(part = "header", j = "Kd2_p",
+            value = as_paragraph("K", as_sub("d2"), " p")) %>%
+    border_remove() %>%
+    border_outer(part = "all",  border = fp_border(color = "black", width = 1.5)) %>%
+    hline(part = "header", i = 1,
+          border = fp_border(color = "black", width = 1.5)) %>%
+    hline(part = "body", i = seq_len(nr - 1),
+          border = fp_border(color = "black", width = 0.5)) %>%
+    vline(part = "all", border = fp_border(color = "black", width = 0.5)) %>%
+    vline_right(part = "all",
+                border = fp_border(color = "black", width = 1.5)) %>%
+    align(part = "header", align = "center") %>%
+    align(part = "body",   align = "center") %>%
+    align(part = "body", j = "mAb",     align = "left") %>%   # ← changed from "Clone"
+    align(part = "body", j = "Verdict", align = "left") %>%
+    font(part = "all", fontname = "Arial") %>%
+    fontsize(part = "header", size = 11) %>%
+    fontsize(part = "body",   size = 10) %>%
+    bold(part = "header") %>%
+    color(i = which(row_colours == "GP1"),
+          color = group_colours[["GP1"]],   part = "body") %>%
+    color(i = which(row_colours == "GPC-A"),
+          color = group_colours[["GPC-A"]], part = "body") %>%
+    color(i = which(row_colours == "GPC-B"),
+          color = group_colours[["GPC-B"]], part = "body") %>%
+    color(i = which(row_colours == "GPC-C"),
+          color = group_colours[["GPC-C"]], part = "body") %>%
+    { ft_tmp <- .
+    if (length(kd1_sig_rows) > 0)
+      ft_tmp <- ft_tmp %>%
+        color(i = kd1_sig_rows, j = "Kd1_p",
+              color = "#CC0000", part = "body") %>%
+        bold(i  = kd1_sig_rows, j = "Kd1_p", part = "body")
+    if (length(kd2_sig_rows) > 0)
+      ft_tmp <- ft_tmp %>%
+        color(i = kd2_sig_rows, j = "Kd2_p",
+              color = "#CC0000", part = "body") %>%
+        bold(i  = kd2_sig_rows, j = "Kd2_p", part = "body")
+    ft_tmp } %>%
+    width(j = "mAb",      width = 0.80) %>%   # ← changed from "Clone"
+    width(j = "Group",     width = 0.65) %>%
+    width(j = "Kd1_slope", width = 0.85) %>%
+    width(j = "Kd1_R2",    width = 0.75) %>%
+    width(j = "Kd1_p",     width = 0.75) %>%
+    width(j = "Kd2_slope", width = 0.85) %>%
+    width(j = "Kd2_R2",    width = 0.75) %>%
+    width(j = "Kd2_p",     width = 0.75) %>%
+    width(j = "Verdict",   width = 1.00) %>%
+    height_all(height = 0.28) %>%
+    hrule(rule = "exact") %>%
+    padding(padding.top = 4, padding.bottom = 4,
+            padding.left = 6, padding.right = 6, part = "all")
+  
+  save_as_image(ft, path = filepath_png, res = 300)
+  message("p-value flextable saved: ", filepath_png)
+  invisible(ft)
+}
+
+make_pvalue_flextable(
+  lm_res       = lm_results,
+  filepath_png = file.path(out_dir, "Kd_pvalue_summary_table.png"),
+  filepath_csv = file.path(out_dir, "Kd_pvalue_summary_table.csv")
+)
+
+cat("\n=== All done. Output in:", out_dir, "===\n")
