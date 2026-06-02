@@ -17,33 +17,31 @@ out_dir    <- "C:\\Users\\shame\\OneDrive\\Documents\\MBiochem\\Part II\\Project
 
 if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 
-## ---- 2. Epitope groups and colours -------------------------
-competition_groups <- tribble(
-  ~clone,    ~group,
-  "12.1F",   "GP1",
-  "19.7E",   "GP1",
-  "10.4B",   "GP1",
-  "25.10C",  "GPC-A",
-  "36.1F",   "GPC-A",
-  "8.11G",   "GPC-A",
-  "37.2D",   "GPC-B",
-  "37.7H",   "GPC-B",
-  "37.2G",   "GPC-B",
-  "36.9F",   "GPC-B",
-  "25.6A",   "GPC-B",
-  "2.9D",    "GPC-B",
-  "18.5C",   "GPC-B",
-  "NE13",    "GPC-B",
-  "9.8A",    "GPC-B",
-  "8.9F",    "GPC-C"
+
+## ---- 2. Competition groups and colours -------------------------
+competition_groups <- data.frame(
+  clone = c(
+    "12.1F", "19.7E", "10.4B",
+    "25.10C", "36.1F", "8.11G",
+    "37.2D", "37.7H", "37.2G", "36.9F", "25.6A", "2.9D", "18.5C", "NE13", "9.8A",
+    "8.9F"
+  ),
+  group = c(
+    "GP1",   "GP1",   "GP1",
+    "GPC-A", "GPC-A", "GPC-A",
+    "GPC-B", "GPC-B", "GPC-B", "GPC-B", "GPC-B", "GPC-B", "GPC-B", "GPC-B", "GPC-B",
+    "GPC-C"
+  ),
+  stringsAsFactors = FALSE
 )
 
 group_colours <- c(
-  "GP1"   = "#0C447C",
-  "GPC-A" = "#E24B4A",
-  "GPC-B" = "#639922",
-  "GPC-C" = "#3B1F0C"
-)
+  "GP1"     = "#0C447C",
+  "GPC-A"   = "#E24B4A",
+  "GPC-B"   = "#639922",
+  "GPC-C"   = "#3B1F0C",
+  "GPC"     = "#000000",
+  "Unknown" = "#888888"
 
 cg_join <- competition_groups %>%
   mutate(mAb = paste0("mAb ", clone)) %>%
