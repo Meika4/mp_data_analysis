@@ -1,0 +1,180 @@
+## ============================================================
+##  Mass Photometry – Gaussian overlay plots for RStudio
+## ============================================================
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(stringr)
+
+csv_path   <- "C:/Users/shame/OneDrive/Documents/MBiochem/Part II/Project/MP Data/MDS7 Monomer, mAbs, Fabs ALONE CSV/Control Gaussians.csv"
+output_dir <- "C:/Users/shame/OneDrive/Documents/MBiochem/Part II/Project/RStudio4Diss/RPlots/MP Control Gaussians 3x3"
+
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+x_max <- 300
+
+competition_groups <- data.frame(
+  clone = c("10.4B", "12.1F", "19.7E",
+            "8.11G", "25.10C", "36.1F",
+            "37.2D", "37.7H", "37.2G", "36.9F", "25.6A", "2.9D", "18.5C", "NE13", "9.8A",
+            "8.9F"),
+  group = c("GP1",   "GP1",   "GP1",
+            "GPC-A", "GPC-A", "GPC-A",
+            "GPC-B", "GPC-B", "GPC-B", "GPC-B", "GPC-B", "GPC-B", "GPC-B", "GPC-B", "GPC-B",
+            "GPC-C"),
+  stringsAsFactors = FALSE
+)
+
+group_colours <- c(
+  "GP1"     = "#0C447C",
+  "GPC-A"   = "#E24B4A",
+  "GPC-B"   = "#639922",
+  "GPC-C"   = "#3B1F0C",
+  "GPC"     = "#000000",
+  "Unknown" = "#888888"
+)
+
+
+raw <- read.csv(csv_path, stringsAsFactors = FALSE, check.names = FALSE)
+
+# ── 2.  HELPER: parse one row into a list of peaks ───────
+parse_peaks <- function(row) {
+  name <- row[["Measurement Name"]]
+  peaks <- list()
+  for (pk in 1:3) {
+    pos_col   <- paste0(pk, ": Mass position (kDa) - Gaussian Overlay")
+    sig_col   <- paste0(pk, ": Mass sigma (kDa) - Gaussian Overlay")
+    cnt_col   <- paste0(pk, ": Mass absolute count - Gaussian Overlay")
+    if (!pos_col %in% names(row)) next
+    pos <- suppressWarnings(as.numeric(trimws(row[[pos_col]])))
+    sig <- suppressWarnings(as.numeric(trimws(row[[sig_col]])))
+    cnt <- suppressWarnings(as.numeric(trimws(row[[cnt_col]])))
+    if (is.na(pos) || is.na(sig) || is.na(cnt)) next
+    peaks[[length(peaks) + 1]] <- data.frame(
+      mu    = pos,
+      sigma = sig,
+      count = cnt
+    )
+  }
+  peaks
+}
+
+# ── 3.  HELPER: decide colour for a measurement name ──────────
+get_colour <- function(meas_name) {
+  if (grepl("MDS7", meas_name, ignore.case = TRUE)) return("#000000")
+  for (i in seq_len(nrow(competition_groups))) {
+    if (grepl(competition_groups$clone[i], meas_name, fixed = TRUE)) {
+      return(group_colours[[competition_groups$group[i]]])
+    }
+  }
+  return(group_colours[["Unknown"]])
+}
+
+# ── 4.  BUILD GAUSSIAN CURVE DATA ─────────────────────────────
+x_seq <- seq(0, x_max, length.out = 2000)
+
+plot_list <- list()
+
+for (i in seq_len(nrow(raw))) {
+  row   <- raw[i, , drop = FALSE]
+  name  <- trimws(row[["Measurement Name"]])
+  peaks <- parse_peaks(row)
+  if (length(peaks) == 0) next
+  
+  colour <- get_colour(name)
+  
+  curve_df <- data.frame(x = x_seq)
+  peak_dfs <- list()
+  
+  for (pk in seq_along(peaks)) {
+    mu  <- peaks[[pk]]$mu
+    sig <- peaks[[pk]]$sigma
+    cnt <- peaks[[pk]]$count
+    y   <- cnt * dnorm(x_seq, mean = mu, sd = sig) /
+      dnorm(mu, mean = mu, sd = sig)
+    col_name <- paste0("peak_", pk)
+    curve_df[[col_name]] <- y
+    peak_dfs[[pk]] <- data.frame(x = x_seq, y = y, peak = paste0("Peak ", pk))
+  }
+  
+  nice_name <- trimws(name)
+  
+  peak_centres <- sapply(peaks, function(pk) pk$mu)
+  peak_heights <- sapply(peaks, function(pk) pk$count)
+  y_range      <- max(peak_heights)
+  
+  label_y <- peak_heights + y_range * 0.15
+  if (length(peak_centres) > 1) {
+    ord <- order(peak_centres)
+    sorted_x <- peak_centres[ord]
+    sorted_y <- label_y[ord]
+    for (j in 2:length(sorted_x)) {
+      if ((sorted_x[j] - sorted_x[j-1]) < 40) {
+        sorted_y[j] <- sorted_y[j-1] + y_range * 0.18
+      }
+    }
+    label_y[ord] <- sorted_y
+  }
+  
+  p <- ggplot()
+  
+  # Pass 1: filled areas only
+  for (pk in seq_along(peaks)) {
+    pk_df <- peak_dfs[[pk]]
+    p <- p + geom_area(data = pk_df, aes(x = x, y = y),
+                       fill = colour, alpha = 0.25, colour = NA)
+  }
+  
+  # Pass 2: solid outlines on top
+  for (pk in seq_along(peaks)) {
+    pk_df <- peak_dfs[[pk]]
+    p <- p + geom_line(data = pk_df, aes(x = x, y = y),
+                       colour = colour, linewidth = 0.9)
+  }
+  
+  p <- p +
+    geom_segment(
+      data = data.frame(
+        x    = peak_centres,
+        xend = peak_centres,
+        y    = 0,
+        yend = peak_heights
+      ),
+      aes(x = x, xend = xend, y = y, yend = yend),
+      colour = colour, linetype = "dotted", linewidth = 0.5
+    ) +
+    annotate("text",
+             x      = peak_centres,
+             y      = label_y,
+             label  = paste0(round(peak_centres, 1), " kDa"),
+             colour = "black", size = 18, hjust = 0.5) +
+    scale_x_continuous(breaks = seq(0, x_max, by = 50), expand = expansion(mult = c(0, 0.02))) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.45))) +
+    coord_cartesian(xlim = c(0, x_max)) +
+    labs(
+      title = nice_name,
+      x     = "Mass (kDa)",
+      y     = "Counts"
+    ) +
+    theme_classic(base_size = 48) +
+    theme(
+      plot.title      = element_text(size = 48, face = "bold", hjust = 0.5, colour = colour),
+      axis.text       = element_text(size = 48),
+      axis.title      = element_text(size = 48),
+      axis.line       = element_line(colour = "black"),
+      axis.ticks      = element_line(colour = "black"),
+      plot.background = element_rect(fill = "white", colour = NA)
+    )
+  
+  plot_list[[name]] <- p
+}
+
+# ── 5.  SAVE: one PNG per measurement ─────────────────────────
+for (nm in names(plot_list)) {
+  safe_name <- gsub("[^A-Za-z0-9._-]", "_", nm)
+  out_file  <- file.path(output_dir, paste0(safe_name, ".png"))
+  ggsave(out_file, plot = plot_list[[nm]],
+         width = 14, height = 9, units = "in", dpi = 600, device = "png")
+  message("Saved: ", out_file)
+}
