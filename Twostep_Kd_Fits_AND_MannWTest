@@ -1,0 +1,631 @@
+## ============================================================
+##  Mass Photometry Kd Analysis v3.5 — GLOBAL TWO-STEP BINDING MODEL FIT
+## ============================================================
+
+library(tidyverse)
+library(stringr)
+library(minpack.lm)
+library(ggplot2)
+library(flextable)
+library(officer)
+library(patchwork)
+library(cowplot)
+library(ggrepel)
+
+## ---- 1. Parameters -----------------------------------------
+MDS7_total_nM   <- 20
+no_binding_mabs <- c("mAb 8.9F")
+all_concs       <- c(4, 5, 10, 20, 40)
+
+out_root   <- "C:\\Users\\shame\\OneDrive\\Documents\\MBiochem\\Part II\\Project\\RStudio4Diss\\RPlots"
+input_file <- "C:\\Users\\shame\\OneDrive\\Documents\\MBiochem\\Part II\\Project\\MP Data\\All mAb MDS7 data\\mAbs_MDS7_Monomer_All_Concentrations.csv"
+
+## ---- 2. Epitope groups and colours -------------------------
+competition_groups <- data.frame(
+  clone = c(
+    "12.1F", "19.7E", "10.4B",
+    "25.10C", "36.1F", "8.11G",
+    "37.2D", "37.7H", "37.2G", "36.9F", "25.6A", "2.9D", "18.5C", "NE13", "9.8A",
+    "8.9F"
+  ),
+  group = c(
+    "GP1",   "GP1",   "GP1",
+    "GPC-A", "GPC-A", "GPC-A",
+    "GPC-B", "GPC-B", "GPC-B", "GPC-B", "GPC-B", "GPC-B", "GPC-B", "GPC-B", "GPC-B",
+    "GPC-C"
+  ),
+  stringsAsFactors = FALSE
+)
+
+competition_groups_join <- competition_groups %>%
+  mutate(mAb = paste0("mAb ", clone)) %>%
+  select(mAb, group)
+
+group_colours <- c("GP1"   = "#0C447C",
+                   "GPC-A" = "#E24B4A",
+                   "GPC-B" = "#639922",
+                   "GPC-C" = "#3B1F0C")
+
+species_colours <- c("free_mAb"    = "#00E5FF",
+                     "complex_1_1" = "#FFD700",
+                     "complex_1_2" = "#E6AAFF")
+
+species_labels <- c("free_mAb"    = "Free mAb",
+                    "complex_1_1" = "1:1 complex",
+                    "complex_1_2" = "1:2 complex")
+
+## ---- 3. Load and parse data --------------------------------
+raw <- read.csv(input_file,
+                header           = TRUE,
+                check.names      = FALSE,
+                stringsAsFactors = FALSE,
+                na.strings       = "N/A")
+colnames(raw)[1:2] <- c("row_idx", "Measurement_Name")
+
+dat <- raw %>%
+  filter(grepl("mAb.*[Mm][Dd][Ss]7 Monomer", Measurement_Name, ignore.case = TRUE)) %>%
+  mutate(Measurement_Name = sub("^[0-9]+_", "", Measurement_Name))
+
+parse_name <- function(name) {
+  name_clean <- str_squish(name)
+  mab  <- str_extract(name_clean, "mAb [0-9]+\\.[0-9]+[A-Z]")
+  conc <- as.numeric(
+    str_match(name_clean,
+              "mAb [0-9]+\\.[0-9]+[A-Z]\\s+([0-9]+)\\s*nM")[, 2])
+  rep  <- str_extract(name_clean, "[IVX]+$")
+  data.frame(mAb = mab, mAb_nM = conc, replicate = rep,
+             stringsAsFactors = FALSE)
+}
+
+meta <- do.call(rbind, lapply(dat$Measurement_Name, parse_name))
+dat  <- cbind(meta, dat)
+dat  <- dat %>% filter(mAb_nM %in% all_concs)
+
+## ---- 4. Extract peaks --------------------------------------
+extract_peaks <- function(row) {
+  peaks <- list()
+  for (i in 1:8) {
+    pos_col <- paste0(i, ": Mass position (kDa) - Gaussian Overlay")
+    abs_col <- paste0(i, ": Mass absolute count - Gaussian Overlay")
+    if (!pos_col %in% names(row)) next
+    pos     <- suppressWarnings(as.numeric(trimws(as.character(row[[pos_col]]))))
+    abs_val <- suppressWarnings(as.numeric(trimws(as.character(row[[abs_col]]))))
+    if (length(pos)==1 && length(abs_val)==1 &&
+        !is.na(pos) && !is.na(abs_val) && pos>0)
+      peaks[[length(peaks)+1]] <- data.frame(peak=i, mass_kDa=pos, abs_count=abs_val)
+  }
+  if (length(peaks)==0) return(NULL)
+  do.call(rbind, peaks)
+}
+
+all_peaks <- lapply(seq_len(nrow(dat)), function(i) {
+  pk <- extract_peaks(dat[i,])
+  if (is.null(pk)) return(NULL)
+  cbind(dat[i, c("mAb","mAb_nM","replicate","Measurement_Name")], pk)
+})
+peaks_df <- do.call(rbind, all_peaks)
+
+## ---- 5. Assign species by kDa window ----------------------
+assign_species <- function(mass) {
+  case_when(
+    mass >= 60  & mass <= 100 ~ "free_MDS7",
+    mass >= 130 & mass <= 180 ~ "free_mAb",
+    mass >= 185 & mass <= 235 ~ "complex_1_1",
+    mass >= 240 & mass <= 330 ~ "complex_1_2",
+    TRUE                      ~ "other"
+  )
+}
+peaks_df <- peaks_df %>% mutate(species = assign_species(mass_kDa))
+
+## ---- 6. Sum counts per species per measurement -------------
+counts_all <- peaks_df %>%
+  filter(species != "other") %>%
+  group_by(mAb, mAb_nM, replicate, Measurement_Name, species) %>%
+  summarise(counts = sum(abs_count), .groups = "drop") %>%
+  pivot_wider(names_from = species, values_from = counts, values_fill = 0)
+
+for (col in c("free_MDS7","free_mAb","complex_1_1","complex_1_2")) {
+  if (!col %in% names(counts_all)) counts_all[[col]] <- 0
+}
+
+counts_all <- counts_all %>%
+  mutate(
+    counts_mAb_total = free_mAb + complex_1_1 + complex_1_2,
+    f_Ab  = if_else(counts_mAb_total>0, free_mAb    / counts_mAb_total, NA_real_),
+    f_1_1 = if_else(counts_mAb_total>0, complex_1_1 / counts_mAb_total, NA_real_),
+    f_1_2 = if_else(counts_mAb_total>0, complex_1_2 / counts_mAb_total, NA_real_)
+  ) %>%
+  left_join(competition_groups_join, by = "mAb")
+
+## ---- 7. Cubic solver ---------------------------------------
+solve_cAg_free <- function(Kd1, Kd2, c_Ab_tot, c_Ag_tot) {
+  if (Kd1<=0||Kd2<=0) return(NA_real_)
+  Ka1 <- 1/Kd1; Ka2 <- 1/Kd2
+  a <- Ka1*Ka2
+  b <- Ka1 + 2*Ka1*Ka2*c_Ab_tot - Ka1*Ka2*c_Ag_tot
+  c <- 1 + Ka1*c_Ab_tot - Ka1*c_Ag_tot
+  d <- -c_Ag_tot
+  rts <- tryCatch(polyroot(c(d,c,b,a)), error=function(e) NULL)
+  if (is.null(rts)) return(NA_real_)
+  real_rts <- Re(rts)[abs(Im(rts))<1e-6]
+  valid    <- real_rts[real_rts>=0 & real_rts<=c_Ag_tot*1.0001]
+  if (length(valid)==0) return(NA_real_)
+  min(valid)
+}
+
+predict_fractions <- function(Kd1, Kd2, c_Ab_tot_vec, c_Ag_tot) {
+  out <- data.frame(c_Ab_tot=c_Ab_tot_vec,
+                    f_Ab=NA_real_, f_1_1=NA_real_, f_1_2=NA_real_)
+  for (i in seq_along(c_Ab_tot_vec)) {
+    c_Ab_tot <- c_Ab_tot_vec[i]
+    c_Ag     <- solve_cAg_free(Kd1, Kd2, c_Ab_tot, c_Ag_tot)
+    if (is.na(c_Ab_tot)||c_Ab_tot==0||is.na(c_Ag)) next
+    Ka1 <- 1/Kd1; Ka2 <- 1/Kd2
+    c_Ab_free <- c_Ab_tot / (1 + Ka1*c_Ag + Ka1*Ka2*c_Ag^2)
+    if (!is.finite(c_Ab_free)||c_Ab_free<0) next
+    c11 <- Ka1*c_Ab_free*c_Ag; c12 <- Ka1*Ka2*c_Ab_free*c_Ag^2
+    tot <- c_Ab_free+c11+c12
+    if (tot<=0) next
+    out$f_Ab[i]  <- c_Ab_free/tot
+    out$f_1_1[i] <- c11/tot
+    out$f_1_2[i] <- c12/tot
+  }
+  out
+}
+
+## ---- 8. Global fit ------------------------------------------
+fit_global <- function(this_mab, data) {
+  if (this_mab %in% no_binding_mabs) {
+    return(data.frame(mAb=this_mab, Kd1_fit_nM=NA_real_, Kd1_fit_SE=NA_real_,
+                      Kd2_fit_nM=NA_real_, Kd2_fit_SE=NA_real_,
+                      r2_global=NA_real_, n_points=0L, converged=FALSE, no_binding=TRUE))
+  }
+  df_fit <- data %>%
+    filter(mAb==this_mab, counts_mAb_total>=30,
+           !is.na(f_Ab), !is.na(f_1_1), !is.na(f_1_2), mAb_nM>0)
+  if (nrow(df_fit)<3) {
+    return(data.frame(mAb=this_mab, Kd1_fit_nM=NA_real_, Kd1_fit_SE=NA_real_,
+                      Kd2_fit_nM=NA_real_, Kd2_fit_SE=NA_real_,
+                      r2_global=NA_real_, n_points=nrow(df_fit), converged=FALSE, no_binding=FALSE))
+  }
+  residuals_fn <- function(par, df) {
+    Kd1<-par[["Kd1"]]; Kd2<-par[["Kd2"]]
+    if (Kd1<=0||Kd2<=0) return(rep(1e6,3*nrow(df)))
+    pred <- predict_fractions(Kd1, Kd2, df$mAb_nM, MDS7_total_nM)
+    if (anyNA(pred$f_Ab)||anyNA(pred$f_1_1)||anyNA(pred$f_1_2)) return(rep(1e6,3*nrow(df)))
+    c(df$f_Ab-pred$f_Ab, df$f_1_1-pred$f_1_1, df$f_1_2-pred$f_1_2)
+  }
+  fit <- tryCatch(
+    nls.lm(par=list(Kd1=median(df_fit$mAb_nM), Kd2=median(df_fit$mAb_nM)*2),
+           lower=c(Kd1=0.001,Kd2=0.001), upper=c(Kd1=1e5,Kd2=1e5),
+           fn=residuals_fn, df=df_fit,
+           control=nls.lm.control(maxiter=500,ftol=1e-9)),
+    error=function(e) NULL)
+  if (is.null(fit)) {
+    return(data.frame(mAb=this_mab, Kd1_fit_nM=NA_real_, Kd1_fit_SE=NA_real_,
+                      Kd2_fit_nM=NA_real_, Kd2_fit_SE=NA_real_,
+                      r2_global=NA_real_, n_points=nrow(df_fit), converged=FALSE, no_binding=FALSE))
+  }
+  cov_mat <- tryCatch(vcov(fit), error=function(e) NULL)
+  if (!is.null(cov_mat)&&all(diag(cov_mat)>=0)) {
+    se_vals <- sqrt(diag(cov_mat)); se_Kd1<-se_vals[["Kd1"]]; se_Kd2<-se_vals[["Kd2"]]
+  } else { se_Kd1<-NA_real_; se_Kd2<-NA_real_ }
+  Kd1<-fit$par[["Kd1"]]; Kd2<-fit$par[["Kd2"]]
+  pred <- predict_fractions(Kd1, Kd2, df_fit$mAb_nM, MDS7_total_nM)
+  obs  <- c(df_fit$f_Ab, df_fit$f_1_1, df_fit$f_1_2)
+  pre  <- c(pred$f_Ab,   pred$f_1_1,   pred$f_1_2)
+  ss_res <- sum((obs-pre)^2, na.rm=TRUE)
+  ss_tot <- sum((obs-mean(obs,na.rm=TRUE))^2, na.rm=TRUE)
+  r2 <- if (ss_tot>0) round(1-ss_res/ss_tot,3) else NA_real_
+  data.frame(mAb=this_mab, Kd1_fit_nM=Kd1, Kd1_fit_SE=se_Kd1,
+             Kd2_fit_nM=Kd2, Kd2_fit_SE=se_Kd2, r2_global=r2,
+             n_points=nrow(df_fit), converged=TRUE, no_binding=FALSE)
+}
+
+## ---- 9. Run global fits ------------------------------------
+mab_list    <- unique(counts_all$mAb)
+fit_results <- do.call(rbind, lapply(mab_list, fit_global, data=counts_all)) %>%
+  left_join(competition_groups_join, by="mAb")
+
+message("Global fit results (Kd1 AND Kd2):")
+for (i in seq_len(nrow(fit_results))) {
+  r <- fit_results[i,]
+  if (r$no_binding)      { message("  ", r$mAb, ": no binding") }
+  else if (!r$converged) { message("  ", r$mAb, ": did not converge (n=", r$n_points, ")") }
+  else { message("  ", r$mAb, ": Kd1=", round(r$Kd1_fit_nM,1), "+/-", round(r$Kd1_fit_SE,1),
+                 " | Kd2=", round(r$Kd2_fit_nM,1), "+/-", round(r$Kd2_fit_SE,1),
+                 " | R2=", r$r2_global) }
+}
+
+## ---- 10. Smooth predicted curves ----------------------------
+mAb_seq <- seq(4, max(all_concs)*1.2, length.out=300)
+
+curves <- fit_results %>%
+  filter(converged) %>%
+  rowwise() %>%
+  do({
+    r <- .
+    preds <- predict_fractions(r$Kd1_fit_nM, r$Kd2_fit_nM,
+                               c_Ab_tot_vec=mAb_seq, c_Ag_tot=MDS7_total_nM)
+    data.frame(mAb=r$mAb, group=r$group, mAb_nM=mAb_seq,
+               f_Ab=preds$f_Ab, f_1_1=preds$f_1_1, f_1_2=preds$f_1_2)
+  }) %>%
+  bind_rows()
+
+## ---- 11. Summary of observed fractions ----------------------
+fraction_summary <- counts_all %>%
+  filter(!is.na(f_Ab)) %>%
+  group_by(mAb, mAb_nM, group) %>%
+  summarise(f_Ab_mean=mean(f_Ab,na.rm=TRUE),    f_Ab_sd=sd(f_Ab,na.rm=TRUE),
+            f_1_1_mean=mean(f_1_1,na.rm=TRUE),  f_1_1_sd=sd(f_1_1,na.rm=TRUE),
+            f_1_2_mean=mean(f_1_2,na.rm=TRUE),  f_1_2_sd=sd(f_1_2,na.rm=TRUE),
+            n_reps=n(), .groups="drop")
+
+## ---- 12. Helpers --------------------------------------------
+clean_name <- function(x) gsub(" ","_",x)
+sig_label  <- function(p) case_when(p<0.001~"***",p<0.01~"**",p<0.05~"*",TRUE~"ns")
+
+## ---- 13. Per-mAb three-fraction plot -----------------------
+make_fraction_plot <- function(this_mab) {
+  df_reps  <- counts_all      %>% filter(mAb==this_mab, !is.na(f_Ab))
+  df_means <- fraction_summary %>% filter(mAb==this_mab)
+  df_curve <- curves           %>% filter(mAb==this_mab)
+  df_fit   <- fit_results      %>% filter(mAb==this_mab)
+  if (nrow(df_means)==0) return(NULL)
+  
+  this_group  <- competition_groups_join$group[competition_groups_join$mAb==this_mab]
+  this_colour <- if (length(this_group)>0 && this_group %in% names(group_colours))
+    group_colours[[this_group]] else "black"
+  is_no_bind  <- this_mab %in% no_binding_mabs
+  
+  reps_long <- df_reps %>%
+    select(mAb_nM, f_Ab, f_1_1, f_1_2) %>%
+    pivot_longer(c(f_Ab,f_1_1,f_1_2), names_to="species", values_to="fraction") %>%
+    mutate(species=case_when(species=="f_Ab"~"free_mAb",
+                             species=="f_1_1"~"complex_1_1",
+                             species=="f_1_2"~"complex_1_2"))
+  
+  means_long <- df_means %>%
+    select(mAb_nM,
+           free_mAb_mean=f_Ab_mean,    free_mAb_sd=f_Ab_sd,
+           complex_1_1_mean=f_1_1_mean, complex_1_1_sd=f_1_1_sd,
+           complex_1_2_mean=f_1_2_mean, complex_1_2_sd=f_1_2_sd) %>%
+    pivot_longer(-mAb_nM,
+                 names_to=c("species",".value"),
+                 names_pattern="(free_mAb|complex_1_1|complex_1_2)_(mean|sd)")
+  
+  curve_long <- df_curve %>%
+    select(mAb_nM, f_Ab, f_1_1, f_1_2) %>%
+    pivot_longer(c(f_Ab,f_1_1,f_1_2), names_to="species", values_to="fraction") %>%
+    mutate(species=case_when(species=="f_Ab"~"free_mAb",
+                             species=="f_1_1"~"complex_1_1",
+                             species=="f_1_2"~"complex_1_2"))
+  
+  sub_text <- if (is_no_bind) {
+    "No binding detected"
+  } else if (nrow(df_fit)>0 && isTRUE(df_fit$converged)) {
+    sprintf("K<sub>d1</sub> = %.1f \u00b1 %.1f nM<br>K<sub>d2</sub> = %.1f \u00b1 %.1f nM<br>R\u00b2 = %.3f (global fit)",
+            df_fit$Kd1_fit_nM, df_fit$Kd1_fit_SE,
+            df_fit$Kd2_fit_nM, df_fit$Kd2_fit_SE,
+            df_fit$r2_global)
+  } else {
+    "No convergence"
+  }
+  
+  p <- ggplot() +
+    geom_point(data=reps_long, aes(x=mAb_nM, y=fraction, colour=species),
+               size=1.5, alpha=0.35, shape=1) +
+    { if (nrow(curve_long)>0)
+      geom_line(data=curve_long, aes(x=mAb_nM, y=fraction, colour=species),
+                linewidth=1.2) } +
+    geom_point(data=means_long, aes(x=mAb_nM, y=mean, colour=species), size=3.5) +
+    geom_errorbar(data=means_long,
+                  aes(x=mAb_nM, ymin=pmax(mean-sd,0), ymax=pmin(mean+sd,1), colour=species),
+                  width=0.8) +
+    scale_colour_manual(values=species_colours, labels=species_labels, name="Species") +
+    scale_x_continuous(name="[mAb] (nM)", breaks=c(4,10,20,40),
+                       limits=c(4, max(all_concs)*1.2)) +
+    scale_y_continuous(name="Fraction of\nmAb-containing species",
+                       limits=c(0,1), breaks=seq(0,1,0.25)) +
+    labs(title=this_mab, subtitle=sub_text) +
+    theme_classic(base_size=48) +
+    theme(
+      plot.title    = element_text(face="bold", size=44, colour=this_colour),
+      plot.subtitle = ggtext::element_markdown(size=34, colour="black",
+                                               hjust=0, lineheight=1.3),
+      axis.title.x  = element_text(size=38, colour="black"),
+      axis.title.y  = element_text(size=38, colour="black", angle=90, hjust=0.5),
+      axis.text     = element_text(size=38, colour="black"),
+      legend.title  = element_text(size=34, face="bold"),
+      legend.text   = element_text(size=38),
+      legend.position  = "right",
+      panel.grid.major = element_line(colour="grey92", linewidth=0.3),
+      panel.grid.minor = element_line(colour="grey96", linewidth=0.15),
+      plot.margin      = margin(40, 15, 20, 10)
+    )
+  p
+}
+
+## ---- 14. Flextable summary table ---------------------------
+make_kd_flextable <- function(fit_res, filepath_png, filepath_csv) {
+  
+  kd_tbl <- fit_res %>%
+    mutate(
+      Kd1   = case_when(no_binding~NA_real_, converged~round(Kd1_fit_nM,2), TRUE~NA_real_),
+      SE1   = case_when(no_binding~NA_real_, converged~round(Kd1_fit_SE,2), TRUE~NA_real_),
+      Kd2   = case_when(no_binding~NA_real_, converged~round(Kd2_fit_nM,2), TRUE~NA_real_),
+      SE2   = case_when(no_binding~NA_real_, converged~round(Kd2_fit_SE,2), TRUE~NA_real_),
+      Kd2_Kd1 = case_when(no_binding~NA_real_,
+                          converged~round(Kd2_fit_nM/Kd1_fit_nM,2), TRUE~NA_real_),
+      R2    = case_when(converged~round(r2_global,3), TRUE~NA_real_),
+      Note  = case_when(no_binding~"No binding", !converged~"No convergence", TRUE~"")
+    ) %>%
+    arrange(group, Kd1) %>%
+    select(mAb, group, Kd1, SE1, Kd2, SE2, Kd2_Kd1, R2, Note)
+  
+  write.csv(kd_tbl, filepath_csv, row.names=FALSE)
+  
+  tbl_disp <- kd_tbl %>%
+    mutate(
+      Kd1      = ifelse(is.na(Kd1),     "\u2014", sprintf("%.2f", Kd1)),
+      SE1      = ifelse(is.na(SE1),     "\u2014", sprintf("%.2f", SE1)),
+      Kd2      = ifelse(is.na(Kd2),     "\u2014", sprintf("%.2f", Kd2)),
+      SE2      = ifelse(is.na(SE2),     "\u2014", sprintf("%.2f", SE2)),
+      Kd2_Kd1  = ifelse(is.na(Kd2_Kd1),"\u2014", sprintf("%.2f", Kd2_Kd1)),
+      R2       = ifelse(is.na(R2),      "\u2014", sprintf("%.3f", R2)),
+      Note     = ifelse(is.na(Note)|Note=="", "\u2014", Note)
+    )
+  
+  row_colours <- tbl_disp$group
+  nr <- nrow(tbl_disp)
+  
+  ft <- flextable(tbl_disp) %>%
+    set_header_labels(
+      mAb      = "mAb",
+      group    = "Group",
+      Kd1      = "Kd1 (nM)",
+      SE1      = "SE1 (nM)",
+      Kd2      = "Kd2 (nM)",
+      SE2      = "SE2 (nM)",
+      Kd2_Kd1  = "Kd2/Kd1",
+      R2       = "R\u00b2",
+      Note     = "Note"
+    ) %>%
+    compose(part="header", j="Kd1",
+            value=as_paragraph("K", as_sub("d1"), " (nM)")) %>%
+    compose(part="header", j="SE1",
+            value=as_paragraph("SE", as_sub("1"), " (nM)")) %>%
+    compose(part="header", j="Kd2",
+            value=as_paragraph("K", as_sub("d2"), " (nM)")) %>%
+    compose(part="header", j="SE2",
+            value=as_paragraph("SE", as_sub("2"), " (nM)")) %>%
+    compose(part="header", j="Kd2_Kd1",
+            value=as_paragraph("K", as_sub("d2"), "/K", as_sub("d1"))) %>%
+    compose(part="header", j="R2",
+            value=as_paragraph("R\u00b2")) %>%
+    border_remove() %>%
+    border_outer(part = "all",  border = fp_border(color = "black", width = 1.5)) %>%
+    hline(part = "header", i = 1,
+          border = fp_border(color = "black", width = 1.5)) %>%
+    hline(part = "body", i = seq_len(nr - 1),
+          border = fp_border(color = "black", width = 0.5)) %>%
+    vline(part = "all", border = fp_border(color = "black", width = 0.5)) %>%
+    vline_right(part = "all",
+                border = fp_border(color = "black", width = 1.5)) %>%
+    align(part="header", align="center") %>%
+    align(part="body",   align="center") %>%
+    align(part="body", j="mAb",  align="left") %>%
+    align(part="body", j="Note", align="left") %>%
+    font(part="all", fontname="Arial") %>%
+    fontsize(part="header", size=11) %>%
+    fontsize(part="body",   size=10) %>%
+    bold(part="header") %>%
+    color(i = which(row_colours == "GP1"),   color = group_colours[["GP1"]],   part="body") %>%
+    color(i = which(row_colours == "GPC-A"), color = group_colours[["GPC-A"]], part="body") %>%
+    color(i = which(row_colours == "GPC-B"), color = group_colours[["GPC-B"]], part="body") %>%
+    color(i = which(row_colours == "GPC-C"), color = group_colours[["GPC-C"]], part="body") %>%
+    width(j="mAb",      width=1.2) %>%
+    width(j="group",    width=0.7) %>%
+    width(j="Kd1",      width=0.85) %>%
+    width(j="SE1",      width=0.85) %>%
+    width(j="Kd2",      width=0.85) %>%
+    width(j="SE2",      width=0.85) %>%
+    width(j="Kd2_Kd1",  width=0.75) %>%
+    width(j="R2",       width=0.6) %>%
+    width(j="Note",     width=1.0) %>%
+    height_all(height=0.28) %>%
+    hrule(rule="exact") %>%
+    padding(padding.top=4, padding.bottom=4,
+            padding.left=6, padding.right=6, part="all")
+  
+  save_as_image(ft, path=filepath_png, res=300)
+  message("Flextable saved: ", filepath_png)
+  invisible(ft)
+}
+
+## ---- 15. Summary dot/bar plots -----------------------------
+make_summary_plots_v35 <- function(fit_res, dir_out) {
+  
+  results_conv <- fit_res %>%
+    filter(converged) %>%
+    mutate(Kd1_low=pmax(Kd1_fit_nM-Kd1_fit_SE,0.01), Kd1_high=Kd1_fit_nM+Kd1_fit_SE,
+           Kd2_low=pmax(Kd2_fit_nM-Kd2_fit_SE,0.01), Kd2_high=Kd2_fit_nM+Kd2_fit_SE)
+  group_levels <- intersect(names(group_colours),unique(results_conv$group))
+  
+  make_dot_plot <- function(kd_col,low_col,high_col,title_expr,y_label) {
+    df_plot <- results_conv %>% arrange(group,.data[[kd_col]]) %>%
+      mutate(mAb=factor(mAb,levels=mAb))
+    ggplot(df_plot,aes(x=mAb,y=.data[[kd_col]],colour=group)) +
+      geom_point(size=4,shape=16) +
+      geom_errorbar(aes(ymin=.data[[low_col]],ymax=.data[[high_col]]),width=0.25) +
+      scale_colour_manual(values=group_colours,name="Competition group") +
+      scale_y_log10(name=y_label,breaks=c(0.1,1,10,100,1000),
+                    labels=c("0.1","1","10","100","1000")) +
+      scale_x_discrete(name=NULL) +
+      labs(title=title_expr) +
+      theme_classic(base_size=48) +
+      theme(axis.text.x  = element_text(angle=45, hjust=1, size=38, colour="black"),
+            axis.text.y  = element_text(size=38, colour="black"),
+            axis.title   = element_text(size=48, colour="black"),
+            legend.position = "right",
+            legend.title = element_text(size=48),
+            legend.text  = element_text(size=38),
+            plot.title   = element_text(face="bold", size=48, colour="black"),
+            panel.grid.major = element_line(colour="grey92", linewidth=0.3),
+            panel.grid.minor = element_line(colour="grey96", linewidth=0.15))
+  }
+  
+  p_dot_Kd1 <- make_dot_plot("Kd1_fit_nM","Kd1_low","Kd1_high",
+                             expression(italic(K)[d1]~"by mAb (global cubic fit)"),
+                             expression(italic(K)[d1]~"(nM)"))
+  p_dot_Kd2 <- make_dot_plot("Kd2_fit_nM","Kd2_low","Kd2_high",
+                             expression(italic(K)[d2]~"by mAb (global cubic fit)"),
+                             expression(italic(K)[d2]~"(nM)"))
+  ggsave(file.path(dir_out,"Kd1_dotplot_by_mAb.png"), plot=p_dot_Kd1,
+         width=14, height=9, dpi=600)
+  ggsave(file.path(dir_out,"Kd2_dotplot_by_mAb.png"), plot=p_dot_Kd2,
+         width=14, height=9, dpi=600)
+  
+  make_bar_plot <- function(kd_col,title_expr,y_label,show_pval=FALSE) {
+    df_plot <- results_conv %>% mutate(group=factor(group,levels=group_levels))
+    grp_sum <- df_plot %>% group_by(group) %>%
+      summarise(mean_val=mean(.data[[kd_col]],na.rm=TRUE),
+                sd_val=sd(.data[[kd_col]],na.rm=TRUE),n_mabs=n(),.groups="drop") %>%
+      mutate(low_val=pmax(mean_val-sd_val,0.01),high_val=mean_val+sd_val)
+    group_pairs <- combn(group_levels,2,simplify=FALSE); n_pairs<-length(group_pairs)
+    mw_res <- lapply(group_pairs,function(pair){
+      g1<-pair[1];g2<-pair[2]
+      v1<-df_plot[[kd_col]][df_plot$group==g1];v2<-df_plot[[kd_col]][df_plot$group==g2]
+      if(length(v1)<2||length(v2)<2)
+        return(data.frame(group1=g1,group2=g2,p_raw=NA_real_,p_adjusted=NA_real_,
+                          label="insufficient n",stringsAsFactors=FALSE))
+      wt<-wilcox.test(v1,v2,exact=FALSE)
+      data.frame(group1=g1,group2=g2,p_raw=wt$p.value,p_adjusted=NA_real_,
+                 label=NA_character_,stringsAsFactors=FALSE)
+    })
+    sig_table<-do.call(rbind,mw_res)
+    sig_table$p_adjusted<-pmin(sig_table$p_raw*n_pairs,1)
+    if (show_pval) {
+      sig_table$label <- ifelse(is.na(sig_table$p_adjusted) | sig_table$p_adjusted > 0.05,
+                                "ns", paste0("p = ", sprintf("%.3f", sig_table$p_adjusted)))
+    } else {
+      sig_table$label <- sig_label(sig_table$p_adjusted)
+    }
+    group_x<-setNames(seq_along(group_levels),group_levels)
+    sig_plot<-sig_table %>% filter(!is.na(p_raw)) %>%
+      mutate(x1=group_x[group1],x2=group_x[group2],span=abs(x2-x1)) %>% arrange(span)
+    max_val<-max(grp_sum$high_val,na.rm=TRUE)
+    sig_plot$bracket_y<-max_val*(1.6^seq_len(nrow(sig_plot)))
+    p<-ggplot()+
+      geom_col(data=grp_sum,aes(x=group,y=mean_val,fill=group),alpha=0.7,width=0.4)+
+      geom_errorbar(data=grp_sum,aes(x=group,ymin=low_val,ymax=high_val),
+                    width=0.12,linewidth=0.35)+
+      geom_point(data=df_plot,aes(x=group,y=.data[[kd_col]]),size=2,shape=21,
+                 fill="white",colour="black")+
+      ggrepel::geom_text_repel(data=df_plot,aes(x=group,y=.data[[kd_col]],label=sub("mAb ","",mAb)),
+                               size=10,colour="black",hjust=1,nudge_x=-0.35,
+                               direction="y",segment.color=NA,min.segment.length=Inf,max.overlaps=Inf)+
+      geom_segment(data=sig_plot,aes(x=x1,xend=x1,y=bracket_y*0.92,yend=bracket_y),
+                   colour="black",linewidth=0.4)+
+      geom_segment(data=sig_plot,aes(x=x2,xend=x2,y=bracket_y*0.92,yend=bracket_y),
+                   colour="black",linewidth=0.4)+
+      geom_segment(data=sig_plot,aes(x=x1,xend=x2,y=bracket_y,yend=bracket_y),
+                   colour="black",linewidth=0.4)+
+      geom_text(data=sig_plot,aes(x=(x1+x2)/2,y=bracket_y*1.05,label=label),
+                colour="black",size=17,vjust=0)+
+      scale_fill_manual(values=group_colours,guide="none")+
+      scale_y_log10(name=y_label,
+                    breaks=c(0.1,1,10,100,1000),
+                    labels=c("0.1","1","10","100","1000")) +
+      scale_x_discrete(name="Competition group",limits=group_levels,
+                       expand=expansion(add=c(0.8, 0.3)))+
+      labs(title=title_expr)+
+      theme_classic(base_size=48)+
+      theme(plot.title  = element_text(face="bold", size=48, colour="black"),
+            axis.title  = element_text(size=48, colour="black"),
+            axis.text   = element_text(size=38, colour="black"),
+            panel.grid.major = element_line(colour="grey92", linewidth=0.3),
+            panel.grid.minor = element_line(colour="grey96", linewidth=0.15),
+            plot.margin = margin(30, 10, 10, 10))   # ← a bit of space at top
+    list(plot=p,sig_table=sig_table)
+  }
+  
+  bar_Kd1 <- make_bar_plot("Kd1_fit_nM",
+                           expression(italic(K)[d1]~"by Competition Group"),
+                           expression(italic(K)[d1]~"(nM)"))
+  bar_Kd2 <- make_bar_plot("Kd2_fit_nM",
+                           expression(italic(K)[d2]~"by Competition Group"),
+                           expression(italic(K)[d2]~"(nM)"))
+  
+  ggsave(file.path(dir_out,"Kd1_barplot_by_group.png"), plot=bar_Kd1$plot,
+         width=14, height=16, dpi=600, bg="white")
+  ggsave(file.path(dir_out,"Kd2_barplot_by_group.png"), plot=bar_Kd2$plot,
+         width=14, height=16, dpi=600, bg="white")
+  
+  bar_Kd1_pval <- make_bar_plot("Kd1_fit_nM",
+                                expression(italic(K)[d1]~"by Competition Group"),
+                                expression(italic(K)[d1]~"(nM)"), show_pval=TRUE)
+  bar_Kd2_pval <- make_bar_plot("Kd2_fit_nM",
+                                expression(italic(K)[d2]~"by Competition Group"),
+                                expression(italic(K)[d2]~"(nM)"), show_pval=TRUE)
+  
+  ggsave(file.path(dir_out,"Kd1_barplot_by_group_pval.png"), plot=bar_Kd1_pval$plot,
+         width=14, height=16, dpi=600, bg="white")
+  ggsave(file.path(dir_out,"Kd2_barplot_by_group_pval.png"), plot=bar_Kd2_pval$plot,
+         width=14, height=16, dpi=600, bg="white")
+  write.csv(bar_Kd1$sig_table,file.path(dir_out,"significance_table_Kd1.csv"),row.names=FALSE)
+  write.csv(bar_Kd2$sig_table,file.path(dir_out,"significance_table_Kd2.csv"),row.names=FALSE)
+  
+  panel_bar <- plot_grid(bar_Kd1$plot, bar_Kd2$plot,
+                         ncol=2, labels=c("A)","B)"),
+                         label_size=34, label_fontface="bold")
+  ggsave(file.path(dir_out,"Kd1_Kd2_barplot_panel.png"),
+         plot=panel_bar, width=28, height=9, dpi=600, bg="white")
+  message("Panelled bar plot saved: Kd1_Kd2_barplot_panel.png")
+}
+
+## ====================================================
+## RUN v3.5
+## ====================================================
+message("\n",paste(rep("=",60),collapse=""))
+message("VERSION 3.5: Global cubic fit + flextable summary table")
+message(paste(rep("=",60),collapse=""))
+
+dir_v35        <- file.path(out_root,"v3.5_global_cubic_flextable 3x3")
+dir_v35_curves <- file.path(dir_v35,"fraction_curves")
+dir_v35_summ   <- file.path(dir_v35,"Kd_summary")
+for (d in c(dir_v35_curves,dir_v35_summ)) dir.create(d,recursive=TRUE,showWarnings=FALSE)
+
+for (this_mab in mab_list) {
+  p <- make_fraction_plot(this_mab)
+  if (is.null(p)) next
+  ggsave(file.path(dir_v35_curves,paste0("fractions_",clean_name(this_mab),".png")),
+         plot=p, width=14, height=9, units="in", dpi=600)
+}
+message("Fraction PNGs saved")
+
+make_summary_plots_v35(fit_results, dir_v35_summ)
+
+make_kd_flextable(
+  fit_res      = fit_results,
+  filepath_png = file.path(dir_v35_summ,"Table_Kd1_Kd2_GlobalFit.png"),
+  filepath_csv = file.path(dir_v35,"Kd_global_fit_table_v35.csv")
+)
+
+kd_console <- fit_results %>%
+  mutate(
+    Kd1_nM=case_when(no_binding~NA_real_,converged~round(Kd1_fit_nM,2),TRUE~NA_real_),
+    SE1_nM=case_when(no_binding~NA_real_,converged~round(Kd1_fit_SE,2),TRUE~NA_real_),
+    Kd2_nM=case_when(no_binding~NA_real_,converged~round(Kd2_fit_nM,2),TRUE~NA_real_),
+    SE2_nM=case_when(no_binding~NA_real_,converged~round(Kd2_fit_SE,2),TRUE~NA_real_),
+    R2    =case_when(converged~round(r2_global,3),TRUE~NA_real_),
+    note  =case_when(no_binding~"No binding detected",
+                     !converged~"Fit did not converge",TRUE~"")
+  ) %>%
+  arrange(group,Kd1_nM) %>%
+  select(mAb,group,Kd1_nM,SE1_nM,Kd2_nM,SE2_nM,R2,n_points,note) %>%
+  as.data.frame()
+
+message("Final Kd values:")
+print(kd_console, row.names=FALSE)
+message("\nAll done. Output: ", dir_v35)
