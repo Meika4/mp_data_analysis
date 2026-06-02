@@ -1,0 +1,189 @@
+## ============================================================
+##  Mass Photometry – mAb + MDS7 Monomer Gaussian plots (WITH percentages)
+## ============================================================
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(patchwork)
+
+# ── 0.  USER SETTINGS ─────────────────────────────────────────
+input_file <- "C:\\Users\\shame\\OneDrive\\Documents\\MBiochem\\Part II\\Project\\MP Data\\All mAb MDS7 data\\mAbs_MDS7_Monomer_All_Concentrations.csv"
+out_root   <- "C:\\Users\\shame\\OneDrive\\Documents\\MBiochem\\Part II\\Project\\RStudio4Diss\\RPlots"
+output_dir <- file.path(out_root, "mAb and MDS7 Gaussians 3x3 Percent")
+
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+x_max <- 400
+
+competition_groups <- data.frame(
+  clone = c(
+    "12.1F", "19.7E", "10.4B",
+    "25.10C", "36.1F", "8.11G",
+    "37.2D", "37.7H", "37.2G", "36.9F", "25.6A", "2.9D", "18.5C", "NE13", "9.8A",
+    "8.9F"
+  ),
+  group = c(
+    "GP1",   "GP1",   "GP1",
+    "GPC-A", "GPC-A", "GPC-A",
+    "GPC-B", "GPC-B", "GPC-B", "GPC-B", "GPC-B", "GPC-B", "GPC-B", "GPC-B", "GPC-B",
+    "GPC-C"
+  ),
+  stringsAsFactors = FALSE
+)
+
+group_colours <- c(
+  "GP1"     = "#0C447C",
+  "GPC-A"   = "#E24B4A",
+  "GPC-B"   = "#639922",
+  "GPC-C"   = "#3B1F0C",
+  "GPC"     = "#000000",
+  "Unknown" = "#888888"
+)
+
+# ── 1. READ CSV ──────────────────────────────────────────────
+raw <- read.csv(input_file, stringsAsFactors = FALSE, check.names = FALSE)
+
+# ── 2. strip leading index ───────────────────────────
+strip_index <- function(s) {
+  trimws(str_remove(s, "^\\d+_"))
+}
+
+# ── 3. parse peaks (up to 6) ────────────────────────
+parse_peaks <- function(row) {
+  peaks <- list()
+  for (pk in 1:6) {
+    pos_col <- paste0(pk, ": Mass position (kDa) - Gaussian Overlay")
+    sig_col <- paste0(pk, ": Mass sigma (kDa) - Gaussian Overlay")
+    cnt_col <- paste0(pk, ": Mass absolute count - Gaussian Overlay")
+    if (!pos_col %in% names(row)) next
+    pos <- suppressWarnings(as.numeric(trimws(row[[pos_col]])))
+    sig <- suppressWarnings(as.numeric(trimws(row[[sig_col]])))
+    cnt <- suppressWarnings(as.numeric(trimws(row[[cnt_col]])))
+    if (is.na(pos) || is.na(sig) || is.na(cnt)) next
+    if (pos <= 0) next
+    peaks[[length(peaks) + 1]] <- list(mu = pos, sigma = sig, count = cnt)
+  }
+  peaks
+}
+
+# ── 4. colour ────────────────────────────────────────
+get_colour <- function(meas_name) {
+  if (grepl("MDS7", meas_name, ignore.case = TRUE) &&
+      !grepl("mAb|Fab", meas_name, ignore.case = TRUE)) return("#000000")
+  for (i in seq_len(nrow(competition_groups)))
+    if (grepl(competition_groups$clone[i], meas_name, fixed = TRUE))
+      return(group_colours[[ competition_groups$group[i] ]])
+  return(group_colours[["Unknown"]])
+}
+
+# ── 5. condition key ─────────────────────────────────
+get_condition <- function(meas_name) {
+  s <- strip_index(meas_name)
+  trimws(str_remove(s, "\\s+(IV|III|II|I)\\s*$"))
+}
+
+# ── 6.   Gaussian curves ───────────────────────────────
+make_curve_data <- function(peaks, x_seq) {
+  lapply(peaks, function(pk) {
+    y <- pk$count * dnorm(x_seq, pk$mu, pk$sigma) /
+      dnorm(pk$mu, pk$mu, pk$sigma)
+    data.frame(x = x_seq, y = y)
+  })
+}
+
+# ── 7.   stagger overlapping labels ────────────────────
+# step_frac (0.30) > y_close threshold (0.25) so a pushed label
+# breaks the chain naturally, giving alternating levels not a staircase.
+# x_close check prevents staggering for peaks far apart in mass.
+stagger_labels <- function(peak_centres, peak_heights,
+                           x_gap = 80, y_thresh = 0.25, step_frac = 0.30) {
+  y_range <- max(peak_heights)
+  label_y <- peak_heights + y_range * 0.15
+  if (length(peak_centres) > 1) {
+    ord <- order(peak_centres)
+    sx  <- peak_centres[ord]
+    sy  <- label_y[ord]
+    for (j in 2:length(sx)) {
+      x_close <- (sx[j] - sx[j-1]) < x_gap
+      y_close <- abs(sy[j] - sy[j-1]) < y_range * y_thresh
+      if (x_close && y_close) {
+        sy[j] <- sy[j-1] + y_range * step_frac
+      }
+    }
+    label_y[ord] <- sy
+  }
+  label_y
+}
+
+x_seq <- seq(0, x_max, length.out = 2000)
+
+# ═══════════════════════════════════════════════════════════════
+#  Individual PNGs
+# ═══════════════════════════════════════════════════════════════
+
+plot_list <- list()
+
+for (i in seq_len(nrow(raw))) {
+  row    <- raw[i, , drop = FALSE]
+  name   <- trimws(row[["Measurement Name"]])
+  peaks  <- parse_peaks(row)
+  if (length(peaks) == 0) next
+  
+  nice_name    <- strip_index(name)
+  nice_name    <- gsub("Monomer ", "", nice_name)
+  colour       <- get_colour(name)
+  peak_dfs     <- make_curve_data(peaks, x_seq)
+  peak_centres <- sapply(peaks, `[[`, "mu")
+  peak_heights <- sapply(peaks, `[[`, "count")
+  total_counts <- sum(peak_heights)
+  peak_pcts    <- round(peak_heights / total_counts * 100, 1)
+  label_y      <- stagger_labels(peak_centres, peak_heights)
+  ann_labels   <- paste0(round(peak_centres), " kDa\n(", peak_pcts, "%)")
+  
+  p <- ggplot()
+  for (pk_df in peak_dfs)
+    p <- p + geom_area(data = pk_df, aes(x = x, y = y),
+                       fill = colour, alpha = 0.25, colour = NA)
+  for (pk_df in peak_dfs)
+    p <- p + geom_line(data = pk_df, aes(x = x, y = y),
+                       colour = colour, linewidth = 0.9)
+  p <- p +
+    geom_segment(
+      data = data.frame(x = peak_centres, xend = peak_centres,
+                        y = 0,            yend = peak_heights),
+      aes(x = x, xend = xend, y = y, yend = yend),
+      colour = colour, linetype = "dotted", linewidth = 0.5
+    ) +
+    annotate("text",
+             x = peak_centres, y = label_y, label = ann_labels,
+             colour = "black", size = 11, hjust = 0.5, lineheight = 0.9) +
+    scale_x_continuous(breaks = seq(0, x_max, by = 50),
+                       expand = expansion(mult = c(0, 0.02))) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.45))) +
+    coord_cartesian(xlim = c(0, x_max)) +
+    labs(title = nice_name, x = "Mass (kDa)", y = "Counts") +
+    theme_classic(base_size = 48) +
+    theme(
+      plot.title      = element_text(size = 48, face = "bold", hjust = 0.5, colour = colour),
+      axis.text       = element_text(size = 48),
+      axis.title      = element_text(size = 48),
+      axis.line       = element_line(colour = "black"),
+      axis.ticks      = element_line(colour = "black"),
+      plot.background = element_rect(fill = "white", colour = NA)
+    )
+  
+  plot_list[[name]] <- list(plot = p, colour = colour,
+                            condition = get_condition(name))
+  
+  safe <- gsub("[^A-Za-z0-9._-]", "_", nice_name)
+  ggsave(file.path(output_dir, paste0(safe, ".png")),
+         plot = p, width = 14, height = 9, units = "in",
+         dpi = 600, device = "png")
+  message("Saved: ", nice_name)
+}
+
+
+
+message("\nAll done.")
